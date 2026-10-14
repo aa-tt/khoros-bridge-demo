@@ -1,0 +1,3 @@
+# CloudFormation
+
+`infra/cloudformation/ecr-bootstrap.yaml` creates four immutable, image-scanned ECR repositories. `msk.yaml` creates the MSK Serverless cluster in an existing VPC. `application.yaml` provisions the application using the VPC/subnet IDs, MSK outputs, built image URIs, and Lambda artifact. Deploy ECR and MSK prerequisites first, create the `bridge-events` topic, then deploy the application stack. Review changesets and IAM policies before execution. Delete the stacks after a sandbox exercise; versioned archive objects and ECR images may outlive the stack depending on retention settings.

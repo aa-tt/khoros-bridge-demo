@@ -1,0 +1,3 @@
+# IAM roles
+
+CloudFormation creates a task execution role for ECR image pulls and CloudWatch logs, separate ECS task roles for REST/SQS/MSK/reporting, and a Lambda execution role. The roles use the ECS task and Lambda service principals and receive only the table, queue, bucket-prefix, secret, and MSK actions required by their services. EventBridge receives a Lambda resource-based permission scoped to the schedule. Never place AWS access keys in React variables, container images, source control, or task environment variables. Review generated policies and narrow them further to your account naming conventions.

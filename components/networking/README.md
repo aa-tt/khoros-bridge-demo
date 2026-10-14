@@ -1,0 +1,3 @@
+# Networking prerequisite
+
+The CloudFormation stacks require an existing VPC and at least two private subnets across Availability Zones. The MSK prerequisite stack creates a broker security group; the application stack creates an internal ALB, API Gateway VPC Link, and task security groups. Fargate tasks are assigned no public IP. Provide NAT or appropriate VPC endpoints for ECR image pulls, CloudWatch Logs, SQS, and DynamoDB; MSK broker access remains private. The REST API is reached through CloudFront, API Gateway, VPC Link, and the internal ALB. This demo does not create a VPC, NAT gateways, DNS, or a public ALB.

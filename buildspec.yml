@@ -1,0 +1,21 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto17
+      nodejs: 20
+      python: 3.12
+    commands:
+      - python -m pip install --user cfn-lint
+  build:
+    commands:
+      - mvn -f services/pom.xml clean verify
+      - cd frontend && npm install && npm run build && cd ..
+      - python -m py_compile lambda/salesforce-sync/handler.py
+      - cfn-lint infra/cloudformation/*.yaml
+artifacts:
+  files:
+    - frontend/dist/**/*
+    - services/**/target/*.jar
+  discard-paths: no

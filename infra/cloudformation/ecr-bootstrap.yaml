@@ -1,0 +1,34 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private container repositories for the Khoros Bridge demo services.
+Resources:
+  RestRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: khoros-bridge/rest-service
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Expire untagged images after 14 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":14},"action":{"type":"expire"}}]}'
+  SqsWorkerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: khoros-bridge/sqs-worker
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+  MskWorkerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: khoros-bridge/msk-worker
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+  ReportingRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: khoros-bridge/reporting-service
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+Outputs:
+  RestRepositoryUri: { Value: !GetAtt RestRepository.RepositoryUri }
+  SqsWorkerRepositoryUri: { Value: !GetAtt SqsWorkerRepository.RepositoryUri }
+  MskWorkerRepositoryUri: { Value: !GetAtt MskWorkerRepository.RepositoryUri }
+  ReportingRepositoryUri: { Value: !GetAtt ReportingRepository.RepositoryUri }

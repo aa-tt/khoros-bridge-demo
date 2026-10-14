@@ -1,0 +1,3 @@
+# CloudWatch and external observability
+
+Each Fargate container writes stdout/stderr to a dedicated CloudWatch log group; Lambda logs use the standard Lambda log group. Log retention is configurable in the stack. Use CloudWatch metrics and alarms for ECS health, queue depth/DLQ, Lambda errors/throttles, and API latency. To send logs to Splunk, configure a supported subscription/Firehose or Splunk forwarder integration. Datadog can collect AWS metrics through its AWS integration and logs through its Forwarder/Firehose path. The demo does not create vendor accounts, tokens, or forwarding destinations.

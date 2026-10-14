@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MSK Serverless prerequisite stack for the Khoros Bridge demo.
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two private subnet IDs in the same VPC, across different AZs.
+Resources:
+  MskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private client access to MSK Serverless IAM brokers.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 0.0.0.0/0 }
+  MskClientIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      SourceSecurityGroupId: !Ref MskSecurityGroup
+  MskCluster:
+    Type: AWS::MSK::ServerlessCluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}-events
+      ClientAuthentication:
+        Sasl:
+          Iam: { Enabled: true }
+      VpcConfigs:
+        - SubnetIds: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref MskSecurityGroup]
+Outputs:
+  ClusterArn:
+    Value: !GetAtt MskCluster.Arn
+  MskSecurityGroupId:
+    Value: !Ref MskSecurityGroup

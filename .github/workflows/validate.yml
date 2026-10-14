@@ -1,0 +1,38 @@
+name: Validate demo
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Java services
+        run: mvn -f services/pom.xml clean verify
+      - name: Build React MFE
+        working-directory: frontend
+        run: npm install && npm run build
+      - name: Validate Lambda syntax
+        run: python -m py_compile lambda/salesforce-sync/handler.py
+      - name: Lint CloudFormation
+        run: |
+          python -m pip install cfn-lint
+          cfn-lint infra/cloudformation/*.yaml

@@ -1,0 +1,11 @@
+{
+  "eventId": "evt-demo-0001",
+  "eventType": "order.created",
+  "occurredAt": "2026-10-15T12:00:00Z",
+  "source": "rest-service",
+  "data": {
+    "orderId": "order-demo-0001",
+    "status": "NEW",
+    "customerRef": "customer-42"
+  }
+}

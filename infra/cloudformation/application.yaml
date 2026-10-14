@@ -1,0 +1,670 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Khoros Bridge demo: CloudFront, API Gateway, ECS Fargate, MSK, SQS, DynamoDB, Lambda, EventBridge, S3, CloudWatch, and IAM.'
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  MskClusterArn:
+    Type: String
+    Description: ARN output by the MSK prerequisite stack.
+  MskBootstrapServers:
+    Type: String
+    Description: IAM SASL broker list output by the MSK prerequisite stack.
+  MskSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Broker security group output by the MSK prerequisite stack.
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two private subnets in different AZs with outbound access for ECS image pulls and logs.
+  RestImage:
+    Type: String
+    Description: Immutable ECR image URI for the REST service.
+  SqsWorkerImage:
+    Type: String
+  MskWorkerImage:
+    Type: String
+  ReportingImage:
+    Type: String
+  LambdaCodeBucket:
+    Type: String
+    Description: Private S3 bucket containing the packaged Lambda zip.
+  LambdaCodeKey:
+    Type: String
+    Default: lambda/handler.zip
+  SalesforceSecretArn:
+    Type: String
+    Description: Secrets Manager ARN with Connected App client_id, client_secret, refresh_token, and optional login_url.
+  SyncScheduleExpression:
+    Type: String
+    Default: rate(1 hour)
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+Resources:
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionArchivedData
+            Status: Enabled
+            Prefix: salesforce/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER_IR
+          - Id: TransitionReports
+            Status: Enabled
+            Prefix: reports/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER_IR
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-frontend-oac
+        Description: Private S3 access for the frontend distribution.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+  SalesforceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+  ReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+  WorkDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  WorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WorkDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      SqsManagedSseEnabled: true
+  WorkQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Work messages are accumulating for more than five minutes.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt WorkQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: One or more messages reached the work queue dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt WorkDeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  RestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/ecs/${AWS::StackName}/rest', RetentionInDays: !Ref LogRetentionDays }
+  SqsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/ecs/${AWS::StackName}/sqs-worker', RetentionInDays: !Ref LogRetentionDays }
+  MskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/ecs/${AWS::StackName}/msk-worker', RetentionInDays: !Ref LogRetentionDays }
+  ReportingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/ecs/${AWS::StackName}/reporting', RetentionInDays: !Ref LogRetentionDays }
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}-cluster
+      ClusterSettings: [{ Name: containerInsights, Value: enabled }]
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+  RestTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: RestServiceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: dynamodb:PutItem, Resource: !GetAtt OrdersTable.Arn }
+              - { Effect: Allow, Action: sqs:SendMessage, Resource: !GetAtt WorkQueue.Arn }
+              - Effect: Allow
+                Action: [kafka-cluster:Connect, kafka-cluster:DescribeCluster, kafka-cluster:WriteDataIdempotently]
+                Resource: !Ref MskClusterArn
+              - Effect: Allow
+                Action: [kafka-cluster:DescribeTopic, kafka-cluster:WriteData]
+                Resource: !Sub arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/*/*/bridge-events
+  SqsWorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: QueueAndEventAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes], Resource: !GetAtt WorkQueue.Arn }
+              - { Effect: Allow, Action: [kafka-cluster:Connect, kafka-cluster:DescribeCluster, kafka-cluster:WriteDataIdempotently], Resource: !Ref MskClusterArn }
+              - Effect: Allow
+                Action: [kafka-cluster:DescribeTopic, kafka-cluster:WriteData]
+                Resource: !Sub arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/*/*/bridge-events
+  MskWorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: MskProjectionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: [kafka-cluster:Connect, kafka-cluster:DescribeCluster], Resource: !Ref MskClusterArn }
+              - Effect: Allow
+                Action: [kafka-cluster:DescribeTopic, kafka-cluster:ReadData]
+                Resource: !Sub arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/*/*/bridge-events
+              - Effect: Allow
+                Action: [kafka-cluster:DescribeGroup, kafka-cluster:AlterGroup]
+                Resource: !Sub arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:group/*/*/order-projection
+              - { Effect: Allow, Action: dynamodb:PutItem, Resource: !GetAtt OrdersTable.Arn }
+  ReportingTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: ReportGenerationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: [kafka-cluster:Connect, kafka-cluster:DescribeCluster], Resource: !Ref MskClusterArn }
+              - Effect: Allow
+                Action: [kafka-cluster:DescribeTopic, kafka-cluster:ReadData]
+                Resource: !Sub arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/*/*/bridge-events
+              - Effect: Allow
+                Action: [kafka-cluster:DescribeGroup, kafka-cluster:AlterGroup]
+                Resource: !Sub arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:group/*/*/reporting-service
+              - { Effect: Allow, Action: dynamodb:PutItem, Resource: !GetAtt ReportsTable.Arn }
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${ArchiveBucket.Arn}/reports/*
+  SalesforceSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: SalesforceSyncAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: logs:CreateLogGroup, Resource: '*' }
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-salesforce-sync:*'
+              - { Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref SalesforceSecretArn }
+              - { Effect: Allow, Action: dynamodb:PutItem, Resource: !GetAtt SalesforceTable.Arn }
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${ArchiveBucket.Arn}/salesforce/*
+  RestSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: REST Fargate task ingress from the internal load balancer and MSK broker access.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 0.0.0.0/0 }
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private worker task egress and MSK broker access.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 0.0.0.0/0 }
+  WorkerMskIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      SourceSecurityGroupId: !Ref WorkerSecurityGroup
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${AWS::StackName}-internal
+      Scheme: internal
+      Type: application
+      Subnets: !Ref PrivateSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Accept HTTP only from the API Gateway VPC Link.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, DestinationSecurityGroupId: !Ref RestSecurityGroup }
+  ApiVpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API Gateway VPC Link ENI egress to the internal load balancer.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: []
+  RestTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckEnabled: true
+      HealthCheckPath: /actuator/health
+      HealthCheckProtocol: HTTP
+      Matcher: { HttpCode: '200-399' }
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: fixed-response, FixedResponseConfig: { StatusCode: '404', ContentType: text/plain, MessageBody: Not found } }]
+  RestTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-rest
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt RestTaskRole.Arn
+      ContainerDefinitions:
+        - Name: rest-service
+          Image: !Ref RestImage
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          Environment:
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: ORDERS_TABLE, Value: !Ref OrdersTable }
+            - { Name: WORK_QUEUE_URL, Value: !Ref WorkQueue }
+            - { Name: MSK_BOOTSTRAP_SERVERS, Value: !Ref MskBootstrapServers }
+            - { Name: MSK_ORDER_TOPIC, Value: bridge-events }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref RestLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: app }
+  SqsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-sqs-worker
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt SqsWorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: sqs-worker
+          Image: !Ref SqsWorkerImage
+          Essential: true
+          Environment:
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: WORK_QUEUE_URL, Value: !Ref WorkQueue }
+            - { Name: MSK_BOOTSTRAP_SERVERS, Value: !Ref MskBootstrapServers }
+            - { Name: MSK_ORDER_TOPIC, Value: bridge-events }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref SqsLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: app }
+  MskTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-msk-worker
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt MskWorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: msk-worker
+          Image: !Ref MskWorkerImage
+          Essential: true
+          Environment:
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: MSK_BOOTSTRAP_SERVERS, Value: !Ref MskBootstrapServers }
+            - { Name: MSK_ORDER_TOPIC, Value: bridge-events }
+            - { Name: ORDERS_TABLE, Value: !Ref OrdersTable }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref MskLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: app }
+  ReportingTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-reporting
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ReportingTaskRole.Arn
+      ContainerDefinitions:
+        - Name: reporting-service
+          Image: !Ref ReportingImage
+          Essential: true
+          Environment:
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: MSK_BOOTSTRAP_SERVERS, Value: !Ref MskBootstrapServers }
+            - { Name: MSK_ORDER_TOPIC, Value: bridge-events }
+            - { Name: REPORTS_BUCKET, Value: !Ref ArchiveBucket }
+            - { Name: REPORTS_TABLE, Value: !Ref ReportsTable }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref ReportingLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: app }
+  RestService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      Cluster: !Ref EcsCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref RestTaskDefinition
+      HealthCheckGracePeriodSeconds: 90
+      NetworkConfiguration:
+        AwsvpcConfiguration: { AssignPublicIp: DISABLED, Subnets: !Ref PrivateSubnetIds, SecurityGroups: [!Ref RestSecurityGroup, !Ref MskSecurityGroupId] }
+      LoadBalancers: [{ ContainerName: rest-service, ContainerPort: 8080, TargetGroupArn: !Ref RestTargetGroup }]
+  SqsWorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref EcsCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref SqsTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration: { AssignPublicIp: DISABLED, Subnets: !Ref PrivateSubnetIds, SecurityGroups: [!Ref WorkerSecurityGroup, !Ref MskSecurityGroupId] }
+  MskWorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref EcsCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref MskTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration: { AssignPublicIp: DISABLED, Subnets: !Ref PrivateSubnetIds, SecurityGroups: [!Ref WorkerSecurityGroup, !Ref MskSecurityGroupId] }
+  ReportingService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref EcsCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref ReportingTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration: { AssignPublicIp: DISABLED, Subnets: !Ref PrivateSubnetIds, SecurityGroups: [!Ref WorkerSecurityGroup, !Ref MskSecurityGroupId] }
+  ApiVpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub ${AWS::StackName}-vpc-link
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [!Ref ApiVpcLinkSecurityGroup]
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-http-api
+      ProtocolType: HTTP
+      DisableExecuteApiEndpoint: false
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref ApiVpcLink
+      IntegrationUri: !Ref HttpListener
+      PayloadFormatVersion: '1.0'
+      TimeoutInMillis: 29000
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /api/{proxy+}'
+      Target: !Sub integrations/${ApiIntegration}
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+  SalesforceSyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-salesforce-sync
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt SalesforceSyncRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Code: { S3Bucket: !Ref LambdaCodeBucket, S3Key: !Ref LambdaCodeKey }
+      Environment:
+        Variables:
+          SALESFORCE_SECRET_ARN: !Ref SalesforceSecretArn
+          SALESFORCE_TABLE: !Ref SalesforceTable
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+          SALESFORCE_API_VERSION: v60.0
+  SalesforceSyncSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Periodic Salesforce synchronization.
+      ScheduleExpression: !Ref SyncScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SalesforceSyncFunction.Arn
+          Id: SalesforceSyncTarget
+  SalesforceSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SalesforceSyncFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SalesforceSyncSchedule.Arn
+  SalesforceLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Salesforce sync Lambda reported an execution error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref SalesforceSyncFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  FrontendSpaFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub ${AWS::StackName}-spa-routing
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Route React client-side paths to the SPA entry point.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          if (request.uri !== '/api' && !request.uri.startsWith('/api/') && !request.uri.split('/').pop().includes('.')) {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+  ApiVpcLinkSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ApiVpcLinkSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      DestinationSecurityGroupId: !Ref AlbSecurityGroup
+  AlbSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ApiVpcLinkSecurityGroup
+  RestTargetGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RestSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+  RestListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 1
+      Conditions: [{ Field: path-pattern, Values: ['/api/*'] }]
+      Actions: [{ Type: forward, TargetGroupArn: !Ref RestTargetGroup }]
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${AWS::StackName} React frontend and API edge.
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: FrontendS3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOriginAccessControl
+            S3OriginConfig: { OriginAccessIdentity: '' }
+          - Id: HttpApiOrigin
+            DomainName: !Select [2, !Split ['/', !GetAtt HttpApi.ApiEndpoint]]
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt FrontendSpaFunction.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: HttpApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        ViewerCertificate: { CloudFrontDefaultCertificate: true, MinimumProtocolVersion: TLSv1.2_2021 }
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+Outputs:
+  FrontendBucketName: { Value: !Ref FrontendBucket }
+  ArchiveBucketName: { Value: !Ref ArchiveBucket }
+  CloudFrontDistributionId: { Value: !Ref CloudFrontDistribution }
+  CloudFrontUrl:
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+  ApiEndpoint: { Value: !GetAtt HttpApi.ApiEndpoint }
+  OrdersTableName: { Value: !Ref OrdersTable }
+  SalesforceTableName: { Value: !Ref SalesforceTable }
+  ReportsTableName: { Value: !Ref ReportsTable }
+  WorkQueueUrl: { Value: !Ref WorkQueue }
+  MskClusterArn: { Value: !Ref MskClusterArn }
